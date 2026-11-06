@@ -423,9 +423,24 @@ def cmd_build() -> None:
                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=True)
     log_path = STATE / "build.log"
     tail: collections.deque[bytes] = collections.deque(maxlen=TAIL_LOG_LINES)
-    state = {"written": 0, "truncated": False}
+    state = {"written": 0, "truncated": False, "sent": 0, "buf": bytearray()}
+
+    def flush_live(force: bool = False) -> None:
+        """Push new log bytes to the service so agents can long-poll them. Never prints to GHA log."""
+        if not state["buf"] and not force:
+            return
+        chunk = bytes(state["buf"])
+        if not chunk:
+            return
+        # Best-effort; do not fail the build if the service is briefly unreachable
+        res = curl("log", "-X", "POST", "-H", "Content-Type: application/octet-stream",
+                   body=chunk, max_time=30, retry=False)
+        if res.returncode == 0:
+            state["sent"] += len(chunk)
+            state["buf"].clear()
 
     def pump() -> None:
+        last_flush = time.time()
         with open(log_path, "wb") as fh:
             for line in proc.stdout:  # type: ignore[union-attr]
                 if state["written"] < HEAD_LOG_BYTES:
@@ -434,9 +449,15 @@ def cmd_build() -> None:
                 else:
                     state["truncated"] = True
                     tail.append(line)
+                state["buf"].extend(line)
+                # Flush every ~2 s or when buffer is large, so agents see progress quickly
+                if len(state["buf"]) >= 16384 or (time.time() - last_flush) >= 2.0:
+                    flush_live()
+                    last_flush = time.time()
             if state["truncated"]:
                 fh.write(b"\n[... middle of the log omitted (too large); last lines follow ...]\n")
                 fh.writelines(tail)
+            flush_live(force=True)  # final chunk
 
     reader = threading.Thread(target=pump, daemon=True)
     reader.start()
