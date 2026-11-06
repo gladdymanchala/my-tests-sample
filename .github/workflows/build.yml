@@ -1,0 +1,161 @@
+# Generic remote-build workflow. Contains no secrets and no project data.
+# The job spec (command, env, artifact globs) and the source are fetched from your service
+# at run time, and build/command output is never printed here, so a PUBLIC repo leaks nothing.
+# mode=build   : run one build command, send the artifact + log back, finish.
+# mode=session : a temporary remote shell; commands arrive from your service and run on this VM.
+name: remote-build
+run-name: ${{ inputs.job_id }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      job_id:
+        description: Opaque job or session id (rb-... / rs-...)
+        required: true
+        type: string
+      language:
+        description: Toolchain preset
+        required: true
+        type: string
+        default: generic
+      mode:
+        description: build or session
+        required: false
+        type: string
+        default: build
+
+permissions:
+  contents: read
+
+env:
+  RB_JOB_ID: ${{ inputs.job_id }}
+  RB_LANGUAGE: ${{ inputs.language }}
+  RB_KIND: ${{ inputs.mode }}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - name: Checkout runner scripts
+        uses: actions/checkout@v4
+        with:
+          path: _rb
+          sparse-checkout: .github/remote-build
+          persist-credentials: false
+
+      - name: Fetch job and source
+        id: fetch
+        env:
+          RB_SERVICE_URL: ${{ secrets.RB_SERVICE_URL }}
+          RB_RUNNER_TOKEN: ${{ secrets.RB_RUNNER_TOKEN }}
+        run: python3 _rb/.github/remote-build/runner.py fetch
+
+      - name: Set up Java
+        if: contains(fromJSON('["android","kotlin","java","flutter"]'), inputs.language)
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ steps.fetch.outputs.java_version }}
+
+      - name: Set up Gradle (dependency cache)
+        if: contains(fromJSON('["android","kotlin","java"]'), inputs.language)
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          add-job-summary: never
+          cache-read-only: false
+
+      - name: Accept Android SDK licenses
+        if: inputs.language == 'android'
+        run: yes | "${ANDROID_HOME}/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+
+      - name: Set up Rust
+        if: inputs.language == 'rust'
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        if: inputs.language == 'rust'
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ${{ steps.fetch.outputs.workdir_rel }}
+
+      - name: Set up Go
+        if: inputs.language == 'go'
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ steps.fetch.outputs.go_version }}
+          cache: false
+
+      - name: Go cache
+        if: inputs.language == 'go'
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/go/pkg/mod
+            ~/.cache/go-build
+          key: go-${{ runner.os }}-${{ hashFiles('src/**/go.sum') }}
+          restore-keys: go-${{ runner.os }}-
+
+      - name: Set up Python
+        if: inputs.language == 'python'
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ steps.fetch.outputs.python_version }}
+
+      - name: Python cache
+        if: inputs.language == 'python'
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-${{ runner.os }}-${{ hashFiles('src/**/requirements*.txt', 'src/**/pyproject.toml') }}
+          restore-keys: pip-${{ runner.os }}-
+
+      - name: Set up Node.js
+        if: inputs.language == 'node'
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ steps.fetch.outputs.node_version }}
+
+      - name: Node cache
+        if: inputs.language == 'node'
+        uses: actions/cache@v4
+        with:
+          path: ~/.npm
+          key: npm-${{ runner.os }}-${{ hashFiles('src/**/package-lock.json') }}
+          restore-keys: npm-${{ runner.os }}-
+
+      - name: Set up Flutter
+        if: inputs.language == 'flutter'
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Install C/C++ toolchain
+        if: inputs.language == 'cpp'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq build-essential cmake ninja-build
+
+      # No secrets are available to this step or to anything the build command runs.
+      - name: Build
+        id: build
+        if: inputs.mode != 'session'
+        timeout-minutes: ${{ fromJSON(steps.fetch.outputs.step_timeout) }}
+        run: python3 _rb/.github/remote-build/runner.py build
+
+      - name: Send artifact and logs to your service
+        if: ${{ inputs.mode != 'session' && !cancelled() && steps.fetch.outcome == 'success' }}
+        env:
+          RB_SERVICE_URL: ${{ secrets.RB_SERVICE_URL }}
+          RB_RUNNER_TOKEN: ${{ secrets.RB_RUNNER_TOKEN }}
+        run: python3 _rb/.github/remote-build/runner.py deliver
+
+      # Interactive session. Only the service URL is present; the per-session token comes from a private file
+      # and the global runner token is NOT available while commands run.
+      - name: Interactive session
+        if: inputs.mode == 'session'
+        timeout-minutes: ${{ fromJSON(steps.fetch.outputs.step_timeout) }}
+        env:
+          RB_SERVICE_URL: ${{ secrets.RB_SERVICE_URL }}
+        run: python3 _rb/.github/remote-build/runner.py session
