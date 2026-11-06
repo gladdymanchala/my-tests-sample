@@ -69,6 +69,20 @@ jobs:
         if: inputs.language == 'android'
         run: yes | "${ANDROID_HOME}/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
 
+      - name: Cache Android SDK packages
+        if: inputs.language == 'android' || inputs.language == 'flutter'
+        uses: actions/cache@v4
+        with:
+          path: |
+            ${{ env.ANDROID_HOME }}/.android
+            ${{ env.ANDROID_HOME }}/platforms
+            ${{ env.ANDROID_HOME }}/build-tools
+            ${{ env.ANDROID_HOME }}/system-images
+            ${{ env.ANDROID_HOME }}/ndk
+            ~/.android
+          key: android-sdk-${{ runner.os }}-${{ hashFiles('src/**/build.gradle*', 'src/**/build.gradle.kts', 'src/**/AndroidManifest.xml') }}
+          restore-keys: android-sdk-${{ runner.os }}-
+
       - name: Set up Rust
         if: inputs.language == 'rust'
         uses: dtolnay/rust-toolchain@stable
