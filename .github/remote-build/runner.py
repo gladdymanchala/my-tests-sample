@@ -335,14 +335,40 @@ def cmd_session() -> None:
         if not files:
             report(cid, "No files matched. Paths are globs relative to the project (or cwd); check them with `ls`/`find`.\n", 1)
             return
-        pkg = package(files, base, c.get("package", "auto"), c.get("name") or "session-files", exact_name=bool(c.get("name")))
-        if len(files) == 1 and c.get("package", "auto") == "auto" and c.get("name"):
+        mode = c.get("package", "auto")
+        limit_mb = int(spec.get("max_artifact_mb", 200))
+        listing = "\n".join(f"  {f.relative_to(base).as_posix()} ({f.stat().st_size} bytes)" for f in files[:50])
+        if mode == "named":
+            names = []
+            for f in files:
+                size = f.stat().st_size
+                if size > limit_mb * 1024 * 1024:
+                    report(cid, f"{f.relative_to(base).as_posix()} is {size // 1048576} MB, above limit {limit_mb} MB.\n", 1)
+                    return
+                rel = f.relative_to(base).as_posix()
+                safe_name = re.sub(r"[^A-Za-z0-9._+-]", "_", rel)[:180]
+                digest = sha256(f)
+                resp = STATE / f"collect-{cid}-{safe_name}.json"
+                up = S("artifact", "-X", "PUT", "-T", str(f), "-o", str(resp), max_time=1800,
+                       query="?filename=" + urllib.parse.quote(safe_name))
+                if up.returncode != 0:
+                    report(cid, f"upload of {rel} failed: {err(up)}\n", 1)
+                    return
+                reply = json.loads(resp.read_text())
+                if reply.get("sha256") != digest:
+                    report(cid, f"checksum mismatch for {rel}\n", 1)
+                    return
+                names.append(reply["filename"])
+            report(cid, f"Collected {len(files)} named file(s): {', '.join(names)}\n{listing}\n", 0)
+            return
+        pkg = package(files, base, mode, c.get("name") or "session-files", exact_name=bool(c.get("name")))
+        if len(files) == 1 and mode == "auto" and c.get("name"):
             renamed = STATE / re.sub(r"[^A-Za-z0-9._-]", "-", c["name"])
             shutil.copy2(pkg, renamed)
             pkg = renamed
         size = pkg.stat().st_size
-        if size > int(spec.get("max_artifact_mb", 200)) * 1024 * 1024:
-            report(cid, f"Artifact is {size // 1048576} MB, above the service limit of {spec.get('max_artifact_mb')} MB.\n", 1)
+        if size > limit_mb * 1024 * 1024:
+            report(cid, f"Artifact is {size // 1048576} MB, above the service limit of {limit_mb} MB.\n", 1)
             return
         digest = sha256(pkg)
         resp = STATE / f"collect-{cid}.json"
@@ -355,7 +381,6 @@ def cmd_session() -> None:
         if reply.get("sha256") != digest:
             report(cid, "checksum mismatch after upload\n", 1)
             return
-        listing = "\n".join(f"  {f.relative_to(base).as_posix()} ({f.stat().st_size} bytes)" for f in files[:50])
         report(cid, f"Collected {len(files)} file(s) -> {reply['filename']} ({size} bytes, sha256 {digest})\n{listing}\n", 0)
 
     def guarded(fn, c: dict) -> None:
@@ -543,22 +568,54 @@ def cmd_deliver() -> None:
                         raise RuntimeError("artifact_paths matched no files (check the glob; paths are relative to the project/working_directory)")
                     result["artifacts"] = [{"path": f.relative_to(workdir).as_posix(), "size": f.stat().st_size}
                                            for f in files[:200]]
-                    pkg = package(files, workdir, spec.get("package", "auto"), spec.get("label") or "build")
-                    size = pkg.stat().st_size
-                    if size > int(spec.get("max_artifact_mb", 200)) * 1024 * 1024:
-                        raise RuntimeError(f"artifact is {size // 1048576} MB, above the service limit of {spec.get('max_artifact_mb')} MB")
-                    digest = sha256(pkg)
-                    up = curl("artifact", "-X", "PUT", "-T", str(pkg), "-o", str(STATE / "upload.json"),
-                              max_time=1800, query="?filename=" + urllib.parse.quote(pkg.name))
-                    if up.returncode != 0:
-                        raise RuntimeError(f"upload to the service failed: {err(up)}")
-                    reply = json.loads((STATE / "upload.json").read_text())
-                    if reply.get("sha256") != digest:
-                        raise RuntimeError("artifact checksum mismatch after upload")
-                    result.update(artifact={"filename": reply["filename"], "size_bytes": size, "sha256": digest,
-                                            "kind": "file" if pkg in files else "zip"},
-                                  package="file" if pkg in files else "zip", ok=True,
-                                  reason="Build finished; the artifact is ready to download.")
+                    mode = spec.get("package", "auto")
+                    limit_mb = int(spec.get("max_artifact_mb", 200))
+                    if mode == "named":
+                        # Upload each file separately so the agent gets individual download URLs
+                        uploaded = []
+                        for i, f in enumerate(files):
+                            size = f.stat().st_size
+                            if size > limit_mb * 1024 * 1024:
+                                raise RuntimeError(
+                                    f"{f.relative_to(workdir).as_posix()} is {size // 1048576} MB, "
+                                    f"above the service limit of {limit_mb} MB")
+                            rel = f.relative_to(workdir).as_posix()
+                            # Flatten path to a safe filename while keeping uniqueness
+                            safe_name = re.sub(r"[^A-Za-z0-9._+-]", "_", rel)[:180]
+                            digest = sha256(f)
+                            q = "?filename=" + urllib.parse.quote(safe_name)
+                            if i > 0:
+                                q += "&append=1"
+                            up = curl("artifact", "-X", "PUT", "-T", str(f),
+                                      "-o", str(STATE / "upload.json"), max_time=1800, query=q)
+                            if up.returncode != 0:
+                                raise RuntimeError(f"upload of {rel} failed: {err(up)}")
+                            reply = json.loads((STATE / "upload.json").read_text())
+                            if reply.get("sha256") != digest:
+                                raise RuntimeError(f"checksum mismatch for {rel}")
+                            uploaded.append({"filename": reply["filename"], "size_bytes": size,
+                                             "sha256": digest, "path": rel})
+                        result.update(artifact={"files": uploaded, "count": len(uploaded), "kind": "named"},
+                                      package="named", ok=True,
+                                      reason=f"Build finished; {len(uploaded)} named artifact(s) ready to download.")
+                    else:
+                        pkg = package(files, workdir, mode, spec.get("label") or "build")
+                        size = pkg.stat().st_size
+                        if size > limit_mb * 1024 * 1024:
+                            raise RuntimeError(
+                                f"artifact is {size // 1048576} MB, above the service limit of {limit_mb} MB")
+                        digest = sha256(pkg)
+                        up = curl("artifact", "-X", "PUT", "-T", str(pkg), "-o", str(STATE / "upload.json"),
+                                  max_time=1800, query="?filename=" + urllib.parse.quote(pkg.name))
+                        if up.returncode != 0:
+                            raise RuntimeError(f"upload to the service failed: {err(up)}")
+                        reply = json.loads((STATE / "upload.json").read_text())
+                        if reply.get("sha256") != digest:
+                            raise RuntimeError("artifact checksum mismatch after upload")
+                        result.update(artifact={"filename": reply["filename"], "size_bytes": size, "sha256": digest,
+                                                "kind": "file" if pkg in files else "zip"},
+                                      package="file" if pkg in files else "zip", ok=True,
+                                      reason="Build finished; the artifact is ready to download.")
                 except Exception as exc:  # noqa: BLE001
                     result["delivery_error"] = str(exc)[:300]
         elif build["timed_out"]:
